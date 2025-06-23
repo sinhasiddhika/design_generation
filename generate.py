@@ -37,8 +37,8 @@ def improved_pattern_analysis(image):
         'confidence': 10
     }
 
-def create_perfect_seamless_tile(image, pattern_info):
-    """Create truly seamless tile with no visible lines"""
+def create_better_seamless_tile(image, pattern_info):
+    """Create seamless tile that actually preserves the pattern"""
     img_array = np.array(image).astype(np.float32)
     h, w = img_array.shape[:2]
     
@@ -51,58 +51,37 @@ def create_perfect_seamless_tile(image, pattern_info):
         tile_w = min(w, max(pattern_info['repeat_x'], w//2))
         tile = img_array[:tile_h, :tile_w]
     
-    # Advanced seamless blending to eliminate ALL visible seams
+    # Improved seamless blending
     tile_h, tile_w = tile.shape[:2]
-    overlap = max(min(tile_h//12, tile_w//12), 8)  # Larger overlap for better seamless effect
+    overlap = max(min(tile_h//16, tile_w//16), 5)  # Smaller overlap for better preservation
     
     try:
-        if overlap > 0 and overlap < min(tile_h//3, tile_w//3):
-            # Create smooth gradient masks
-            fade_h = np.zeros(tile_h)
-            fade_w = np.zeros(tile_w)
+        if overlap > 0 and overlap < min(tile_h//4, tile_w//4):
+            # Create alpha masks for smooth blending
+            alpha_h = np.linspace(0, 1, overlap)
+            alpha_w = np.linspace(0, 1, overlap)
             
-            # Cosine-based smooth transitions (better than linear)
+            # Horizontal blending (left-right)
             for i in range(overlap):
-                progress = i / overlap
-                weight = 0.5 * (1 - np.cos(progress * np.pi))  # Smooth S-curve
-                fade_h[i] = weight
-                fade_h[-(i+1)] = weight
-                fade_w[i] = weight
-                fade_w[-(i+1)] = weight
+                # Left edge
+                tile[:, i] = tile[:, i] * (1 - alpha_w[i]) + tile[:, -(overlap-i)] * alpha_w[i]
+                # Right edge  
+                tile[:, -(i+1)] = tile[:, -(i+1)] * (1 - alpha_w[i]) + tile[:, (overlap-i-1)] * alpha_w[i]
             
-            # Apply 2D blending
-            fade_2d = np.outer(fade_h, fade_w)
-            fade_2d = np.minimum(fade_2d, 1.0)
-            
-            # Create seamless versions by wrapping
-            wrapped_h = np.roll(tile, tile_h//2, axis=0)
-            wrapped_w = np.roll(tile, tile_w//2, axis=1)
-            wrapped_both = np.roll(np.roll(tile, tile_h//2, axis=0), tile_w//2, axis=1)
-            
-            # Blend edges with wrapped versions
-            if len(tile.shape) == 3:
-                fade_2d = np.expand_dims(fade_2d, axis=2)
-            
-            # Horizontal edges
-            tile[:overlap, :] = (tile[:overlap, :] * (1 - fade_h[:overlap, None, None] if len(tile.shape) == 3 else fade_h[:overlap, None]) + 
-                               wrapped_h[:overlap, :] * (fade_h[:overlap, None, None] if len(tile.shape) == 3 else fade_h[:overlap, None]))
-            tile[-overlap:, :] = (tile[-overlap:, :] * (1 - fade_h[-overlap:, None, None] if len(tile.shape) == 3 else fade_h[-overlap:, None]) + 
-                                wrapped_h[-overlap:, :] * (fade_h[-overlap:, None, None] if len(tile.shape) == 3 else fade_h[-overlap:, None]))
-            
-            # Vertical edges
-            tile[:, :overlap] = (tile[:, :overlap] * (1 - fade_w[:overlap]) + 
-                               wrapped_w[:, :overlap] * fade_w[:overlap])
-            tile[:, -overlap:] = (tile[:, -overlap:] * (1 - fade_w[-overlap:]) + 
-                                wrapped_w[:, -overlap:] * fade_w[-overlap:])
-            
+            # Vertical blending (top-bottom)
+            for i in range(overlap):
+                # Top edge
+                tile[i, :] = tile[i, :] * (1 - alpha_h[i]) + tile[-(overlap-i), :] * alpha_h[i]
+                # Bottom edge
+                tile[-(i+1), :] = tile[-(i+1), :] * (1 - alpha_h[i]) + tile[(overlap-i-1), :] * alpha_h[i]
     except Exception as e:
-        print(f"Seamless blending error: {e}")
+        print(f"Blending error: {e}")
         pass
     
     return Image.fromarray(np.clip(tile, 0, 255).astype(np.uint8))
 
-def smart_seamless_tiling(tile, output_width, output_height):
-    """Improved tiling with perfect seamless connections"""
+def smart_tiling(tile, output_width, output_height):
+    """Improved tiling that maintains pattern integrity"""
     tile_array = np.array(tile)
     tile_h, tile_w = tile_array.shape[:2]
     
@@ -110,12 +89,12 @@ def smart_seamless_tiling(tile, output_width, output_height):
         raise ValueError("Invalid tile dimensions")
     
     # Calculate exact number of tiles needed
-    tiles_x = (output_width + tile_w - 1) // tile_w
+    tiles_x = (output_width + tile_w - 1) // tile_w  # Ceiling division
     tiles_y = (output_height + tile_h - 1) // tile_h
     
-    # Create oversized canvas to ensure no edge artifacts
-    canvas_w = tiles_x * tile_w
-    canvas_h = tiles_y * tile_h
+    # Create the tiled image
+    tiled_h = tiles_y * tile_h
+    tiled_w = tiles_x * tile_w
     
     # Use numpy tile for perfect repetition
     if len(tile_array.shape) == 3:
@@ -123,35 +102,10 @@ def smart_seamless_tiling(tile, output_width, output_height):
     else:
         tiled_array = np.tile(tile_array, (tiles_y, tiles_x))
     
-    # Additional seamless smoothing at tile boundaries
-    smoothed = tiled_array.copy().astype(np.float32)
-    
-    # Light gaussian blur only at tile boundaries to eliminate any remaining seams
-    from scipy import ndimage
-    boundary_mask = np.zeros((canvas_h, canvas_w), dtype=bool)
-    
-    # Mark tile boundaries
-    for y in range(1, tiles_y):
-        boundary_mask[y * tile_h - 2:y * tile_h + 2, :] = True
-    for x in range(1, tiles_x):
-        boundary_mask[:, x * tile_w - 2:x * tile_w + 2] = True
-    
-    # Apply very light smoothing only at boundaries
-    if np.any(boundary_mask):
-        if len(smoothed.shape) == 3:
-            for channel in range(smoothed.shape[2]):
-                channel_data = smoothed[:, :, channel]
-                smoothed_channel = ndimage.gaussian_filter(channel_data, sigma=0.8)
-                channel_data[boundary_mask] = smoothed_channel[boundary_mask]
-                smoothed[:, :, channel] = channel_data
-        else:
-            smoothed_data = ndimage.gaussian_filter(smoothed, sigma=0.8)
-            smoothed[boundary_mask] = smoothed_data[boundary_mask]
-    
     # Crop to exact output dimensions
-    final_array = smoothed[:output_height, :output_width]
+    final_array = tiled_array[:output_height, :output_width]
     
-    return Image.fromarray(np.clip(final_array, 0, 255).astype(np.uint8))
+    return Image.fromarray(final_array)
 
 def enhance_carpet_realism(image, intensity=0.3):
     """Add subtle carpet-like texture without destroying the pattern"""
@@ -190,8 +144,8 @@ def generate_accurate_carpet_design(original_image, output_width, output_height,
         # Step 1: Analyze the pattern with better preservation
         pattern_info = improved_pattern_analysis(original_image)
         
-        # Step 2: Create perfectly seamless tile with no visible lines
-        seamless_tile = create_perfect_seamless_tile(original_image, pattern_info)
+        # Step 2: Create seamless tile that preserves the original pattern
+        seamless_tile = create_better_seamless_tile(original_image, pattern_info)
         
         # Step 3: Tile the pattern accurately
         complete_design = smart_tiling(seamless_tile, output_width, output_height)
