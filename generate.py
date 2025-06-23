@@ -14,76 +14,107 @@ def advanced_pattern_analysis(image):
     img_gray = np.array(image.convert('L'))
     h, w = img_gray.shape
     
+    # Ensure minimum dimensions
+    if h < 20 or w < 20:
+        return {'template_size': (max(h//2, 10), max(w//2, 10)), 'repeat_y': max(h//2, 10), 'repeat_x': max(w//2, 10), 'confidence': 1}
+    
     # Template matching for pattern detection
     patterns = []
     
-    # Try different template sizes
-    for template_size in [(h//4, w//4), (h//3, w//3), (h//2, w//2)]:
-        th, tw = template_size
-        if th > 10 and tw > 10:
-            template = img_gray[:th, :tw]
-            
-            # Cross-correlation to find repeating patterns
-            correlation = correlate2d(img_gray, template, mode='valid')
-            
-            # Find peaks in correlation
-            threshold = np.max(correlation) * 0.7
-            peaks = np.where(correlation > threshold)
-            
-            if len(peaks[0]) > 1:
-                # Calculate pattern repeat distances
-                y_diffs = np.diff(sorted(peaks[0]))
-                x_diffs = np.diff(sorted(peaks[1]))
-                
-                y_repeat = np.median(y_diffs) if len(y_diffs) > 0 else th
-                x_repeat = np.median(x_diffs) if len(x_diffs) > 0 else tw
-                
-                patterns.append({
-                    'template_size': template_size,
-                    'repeat_y': int(y_repeat),
-                    'repeat_x': int(x_repeat),
-                    'confidence': len(peaks[0])
-                })
+    # Try different template sizes with safety checks
+    template_sizes = [(h//4, w//4), (h//3, w//3), (h//2, w//2)]
     
-    # Select best pattern
+    for template_size in template_sizes:
+        th, tw = template_size
+        # Ensure minimum template size
+        th = max(th, 10)
+        tw = max(tw, 10)
+        
+        # Ensure template doesn't exceed image size
+        th = min(th, h - 1)
+        tw = min(tw, w - 1)
+        
+        if th > 5 and tw > 5 and th < h and tw < w:
+            try:
+                template = img_gray[:th, :tw]
+                
+                # Cross-correlation to find repeating patterns
+                correlation = correlate2d(img_gray, template, mode='valid')
+                
+                if correlation.size > 0:
+                    # Find peaks in correlation
+                    threshold = np.max(correlation) * 0.7
+                    peaks = np.where(correlation > threshold)
+                    
+                    if len(peaks[0]) > 1:
+                        # Calculate pattern repeat distances
+                        y_diffs = np.diff(sorted(peaks[0]))
+                        x_diffs = np.diff(sorted(peaks[1]))
+                        
+                        y_repeat = np.median(y_diffs) if len(y_diffs) > 0 else th
+                        x_repeat = np.median(x_diffs) if len(x_diffs) > 0 else tw
+                        
+                        # Ensure repeat values are valid
+                        y_repeat = max(int(y_repeat), 10)
+                        x_repeat = max(int(x_repeat), 10)
+                        
+                        patterns.append({
+                            'template_size': (th, tw),
+                            'repeat_y': y_repeat,
+                            'repeat_x': x_repeat,
+                            'confidence': len(peaks[0])
+                        })
+            except Exception as e:
+                continue
+    
+    # Select best pattern or return default
     if patterns:
         best_pattern = max(patterns, key=lambda x: x['confidence'])
         return best_pattern
     else:
-        return {'template_size': (h//2, w//2), 'repeat_y': h//2, 'repeat_x': w//2, 'confidence': 1}
+        # Return safe default values
+        return {
+            'template_size': (max(h//2, 20), max(w//2, 20)), 
+            'repeat_y': max(h//2, 20), 
+            'repeat_x': max(w//2, 20), 
+            'confidence': 1
+        }
 
 def detect_chevron_pattern(image):
     """Specialized detection for chevron/herringbone patterns"""
-    img_gray = np.array(image.convert('L'))
-    
-    # Edge detection
-    edges = cv2.Canny(img_gray, 50, 150)
-    
-    # Line detection using Hough transform
-    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=50)
-    
-    if lines is not None:
-        angles = []
-        for rho, theta in lines[:, 0]:
-            angle = np.degrees(theta)
-            angles.append(angle)
+    try:
+        img_gray = np.array(image.convert('L'))
         
-        angles = np.array(angles)
+        # Edge detection
+        edges = cv2.Canny(img_gray, 50, 150)
         
-        # Check for chevron pattern (two dominant angles)
-        unique_angles = []
-        for angle in angles:
-            if not unique_angles or min([abs(angle - ua) for ua in unique_angles]) > 10:
-                unique_angles.append(angle)
+        # Line detection using Hough transform
+        lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=50)
         
-        is_chevron = len(unique_angles) >= 2
-        dominant_angle = np.median(angles) if len(angles) > 0 else 0
-        
-        return {
-            'is_chevron': is_chevron,
-            'dominant_angle': dominant_angle,
-            'angles': unique_angles[:4]  # Top 4 angles
-        }
+        if lines is not None and len(lines) > 0:
+            angles = []
+            for rho, theta in lines[:, 0]:
+                angle = np.degrees(theta)
+                angles.append(angle)
+            
+            angles = np.array(angles)
+            
+            # Check for chevron pattern (two dominant angles)
+            unique_angles = []
+            for angle in angles:
+                if not unique_angles or min([abs(angle - ua) for ua in unique_angles]) > 10:
+                    unique_angles.append(angle)
+            
+            is_chevron = len(unique_angles) >= 2
+            dominant_angle = np.median(angles) if len(angles) > 0 else 0
+            
+            return {
+                'is_chevron': is_chevron,
+                'dominant_angle': dominant_angle,
+                'angles': unique_angles[:4]  # Top 4 angles
+            }
+    except Exception as e:
+        pass
     
     return {'is_chevron': False, 'dominant_angle': 0, 'angles': []}
 
@@ -92,35 +123,44 @@ def create_seamless_tile(image, pattern_info):
     img_array = np.array(image).astype(np.float32)
     h, w, c = img_array.shape
     
-    # Calculate optimal tile size based on pattern analysis
-    tile_h = min(h, pattern_info['repeat_y'] * 2)
-    tile_w = min(w, pattern_info['repeat_x'] * 2)
+    # Calculate optimal tile size based on pattern analysis with safety checks
+    tile_h = min(h, max(pattern_info['repeat_y'] * 2, 20))
+    tile_w = min(w, max(pattern_info['repeat_x'] * 2, 20))
+    
+    # Ensure tile dimensions are valid
+    tile_h = max(min(tile_h, h), 20)
+    tile_w = max(min(tile_w, w), 20)
     
     # Extract the base tile
     tile = img_array[:tile_h, :tile_w]
     
     # Create seamless edges using frequency domain blending
     overlap = min(tile_h//8, tile_w//8, 20)
+    overlap = max(overlap, 1)  # Ensure overlap is at least 1
     
-    if overlap > 0:
-        # Horizontal seamless
-        left_edge = tile[:, :overlap]
-        right_edge = tile[:, -overlap:]
-        
-        # Create smooth transition
-        for i in range(overlap):
-            alpha = i / overlap
-            tile[:, i] = left_edge[:, i] * (1 - alpha) + right_edge[:, i] * alpha
-            tile[:, -(i+1)] = right_edge[:, -(i+1)] * (1 - alpha) + left_edge[:, -(i+1)] * alpha
-        
-        # Vertical seamless
-        top_edge = tile[:overlap, :]
-        bottom_edge = tile[-overlap:, :]
-        
-        for i in range(overlap):
-            alpha = i / overlap
-            tile[i, :] = top_edge[i, :] * (1 - alpha) + bottom_edge[i, :] * alpha
-            tile[-(i+1), :] = bottom_edge[-(i+1), :] * (1 - alpha) + top_edge[-(i+1), :] * alpha
+    try:
+        if overlap > 0 and overlap < min(tile_h//2, tile_w//2):
+            # Horizontal seamless
+            left_edge = tile[:, :overlap]
+            right_edge = tile[:, -overlap:]
+            
+            # Create smooth transition
+            for i in range(overlap):
+                alpha = i / overlap
+                tile[:, i] = left_edge[:, i] * (1 - alpha) + right_edge[:, i] * alpha
+                tile[:, -(i+1)] = right_edge[:, -(i+1)] * (1 - alpha) + left_edge[:, -(i+1)] * alpha
+            
+            # Vertical seamless
+            top_edge = tile[:overlap, :]
+            bottom_edge = tile[-overlap:, :]
+            
+            for i in range(overlap):
+                alpha = i / overlap
+                tile[i, :] = top_edge[i, :] * (1 - alpha) + bottom_edge[i, :] * alpha
+                tile[-(i+1), :] = bottom_edge[-(i+1), :] * (1 - alpha) + top_edge[-(i+1), :] * alpha
+    except Exception as e:
+        # If blending fails, just use the original tile
+        pass
     
     return Image.fromarray(tile.astype(np.uint8))
 
@@ -129,9 +169,13 @@ def intelligent_chevron_tiling(tile, output_width, output_height, chevron_info):
     tile_array = np.array(tile)
     tile_h, tile_w = tile_array.shape[:2]
     
-    # Calculate how many tiles needed
-    tiles_x = (output_width // tile_w) + 2
-    tiles_y = (output_height // tile_h) + 2
+    # Ensure tile dimensions are valid
+    if tile_h == 0 or tile_w == 0:
+        raise ValueError("Invalid tile dimensions")
+    
+    # Calculate how many tiles needed with safety checks
+    tiles_x = max((output_width // tile_w) + 2, 1)
+    tiles_y = max((output_height // tile_h) + 2, 1)
     
     # Create larger canvas
     canvas_w = tiles_x * tile_w
@@ -141,26 +185,33 @@ def intelligent_chevron_tiling(tile, output_width, output_height, chevron_info):
     # For chevron patterns, alternate tile orientations
     for y in range(tiles_y):
         for x in range(tiles_x):
-            current_tile = tile_array.copy()
-            
-            # Chevron pattern logic
-            if chevron_info['is_chevron']:
-                # Alternate flipping for chevron effect
-                if (x + y) % 2 == 1:
-                    current_tile = np.flip(current_tile, axis=1)  # Horizontal flip
+            try:
+                current_tile = tile_array.copy()
                 
-                # Additional rotation for some positions
-                if chevron_info['dominant_angle'] > 45:
-                    if (x % 2 == 0 and y % 2 == 1) or (x % 2 == 1 and y % 2 == 0):
-                        current_tile = np.flip(current_tile, axis=0)  # Vertical flip
-            
-            # Place tile
-            y_start = y * tile_h
-            y_end = min(y_start + tile_h, canvas_h)
-            x_start = x * tile_w
-            x_end = min(x_start + tile_w, canvas_w)
-            
-            canvas[y_start:y_end, x_start:x_end] = current_tile[:y_end-y_start, :x_end-x_start]
+                # Chevron pattern logic
+                if chevron_info.get('is_chevron', False):
+                    # Alternate flipping for chevron effect
+                    if (x + y) % 2 == 1:
+                        current_tile = np.flip(current_tile, axis=1)  # Horizontal flip
+                    
+                    # Additional rotation for some positions
+                    if chevron_info.get('dominant_angle', 0) > 45:
+                        if (x % 2 == 0 and y % 2 == 1) or (x % 2 == 1 and y % 2 == 0):
+                            current_tile = np.flip(current_tile, axis=0)  # Vertical flip
+                
+                # Place tile
+                y_start = y * tile_h
+                y_end = min(y_start + tile_h, canvas_h)
+                x_start = x * tile_w
+                x_end = min(x_start + tile_w, canvas_w)
+                
+                # Ensure we don't go out of bounds
+                tile_y_end = min(tile_h, y_end - y_start)
+                tile_x_end = min(tile_w, x_end - x_start)
+                
+                canvas[y_start:y_end, x_start:x_end] = current_tile[:tile_y_end, :tile_x_end]
+            except Exception as e:
+                continue
     
     # Crop to exact dimensions
     final_canvas = canvas[:output_height, :output_width]
@@ -168,90 +219,117 @@ def intelligent_chevron_tiling(tile, output_width, output_height, chevron_info):
 
 def create_realistic_carpet_texture(image):
     """Add realistic carpet texture and appearance"""
-    # Convert to array
-    img_array = np.array(image).astype(np.float32)
-    
-    # Add subtle fiber texture
-    h, w = img_array.shape[:2]
-    
-    # Create fiber-like noise
-    noise_scale = 0.5
-    fiber_noise = np.random.normal(0, noise_scale, (h, w, 3))
-    
-    # Create directional texture (carpet fibers)
-    x = np.arange(w)
-    y = np.arange(h)
-    X, Y = np.meshgrid(x, y)
-    
-    # Subtle directional pattern
-    direction_pattern = np.sin(X * 0.1) * np.cos(Y * 0.1) * 2
-    direction_pattern = np.stack([direction_pattern] * 3, axis=2)
-    
-    # Combine textures
-    textured = img_array + fiber_noise + direction_pattern
-    
-    # Add subtle color variations
-    color_variation = np.random.normal(1, 0.02, img_array.shape)
-    textured = textured * color_variation
-    
-    # Ensure values stay in valid range
-    textured = np.clip(textured, 0, 255)
-    
-    # Convert back to PIL Image
-    textured_image = Image.fromarray(textured.astype(np.uint8))
-    
-    # Apply carpet-specific filters
-    # Slight blur for fiber softness
-    textured_image = textured_image.filter(ImageFilter.GaussianBlur(radius=0.3))
-    
-    # Enhance contrast slightly
-    enhancer = ImageEnhance.Contrast(textured_image)
-    textured_image = enhancer.enhance(1.1)
-    
-    # Reduce saturation slightly for realistic look
-    enhancer = ImageEnhance.Color(textured_image)
-    textured_image = enhancer.enhance(0.95)
-    
-    return textured_image
+    try:
+        # Convert to array
+        img_array = np.array(image).astype(np.float32)
+        
+        # Add subtle fiber texture
+        h, w = img_array.shape[:2]
+        
+        # Create fiber-like noise
+        noise_scale = 0.5
+        fiber_noise = np.random.normal(0, noise_scale, (h, w, 3))
+        
+        # Create directional texture (carpet fibers)
+        x = np.arange(w)
+        y = np.arange(h)
+        X, Y = np.meshgrid(x, y)
+        
+        # Subtle directional pattern
+        direction_pattern = np.sin(X * 0.1) * np.cos(Y * 0.1) * 2
+        direction_pattern = np.stack([direction_pattern] * 3, axis=2)
+        
+        # Combine textures
+        textured = img_array + fiber_noise + direction_pattern
+        
+        # Add subtle color variations
+        color_variation = np.random.normal(1, 0.02, img_array.shape)
+        textured = textured * color_variation
+        
+        # Ensure values stay in valid range
+        textured = np.clip(textured, 0, 255)
+        
+        # Convert back to PIL Image
+        textured_image = Image.fromarray(textured.astype(np.uint8))
+        
+        # Apply carpet-specific filters
+        # Slight blur for fiber softness
+        textured_image = textured_image.filter(ImageFilter.GaussianBlur(radius=0.3))
+        
+        # Enhance contrast slightly
+        enhancer = ImageEnhance.Contrast(textured_image)
+        textured_image = enhancer.enhance(1.1)
+        
+        # Reduce saturation slightly for realistic look
+        enhancer = ImageEnhance.Color(textured_image)
+        textured_image = enhancer.enhance(0.95)
+        
+        return textured_image
+    except Exception as e:
+        # If texture enhancement fails, return original image
+        return image
 
 def generate_carpet_design(original_image, output_width, output_height, quality_mode="high"):
     """Main function to generate complete carpet design"""
     
-    # Step 1: Advanced pattern analysis
-    pattern_info = advanced_pattern_analysis(original_image)
-    chevron_info = detect_chevron_pattern(original_image)
-    
-    # Step 2: Create seamless tile
-    seamless_tile = create_seamless_tile(original_image, pattern_info)
-    
-    # Step 3: Intelligent tiling based on pattern type
-    if chevron_info['is_chevron']:
-        complete_design = intelligent_chevron_tiling(seamless_tile, output_width, output_height, chevron_info)
-    else:
-        # Standard tiling for non-chevron patterns
-        tile_array = np.array(seamless_tile)
-        tile_h, tile_w = tile_array.shape[:2]
+    try:
+        # Validate inputs
+        if output_width <= 0 or output_height <= 0:
+            raise ValueError("Output dimensions must be positive")
         
-        tiles_x = (output_width // tile_w) + 1
-        tiles_y = (output_height // tile_h) + 1
+        # Step 1: Advanced pattern analysis
+        pattern_info = advanced_pattern_analysis(original_image)
+        chevron_info = detect_chevron_pattern(original_image)
         
-        # Create tiled image
-        tiled = np.tile(tile_array, (tiles_y, tiles_x, 1))
-        complete_design = Image.fromarray(tiled[:output_height, :output_width])
+        # Step 2: Create seamless tile
+        seamless_tile = create_seamless_tile(original_image, pattern_info)
+        
+        # Step 3: Intelligent tiling based on pattern type
+        if chevron_info.get('is_chevron', False):
+            complete_design = intelligent_chevron_tiling(seamless_tile, output_width, output_height, chevron_info)
+        else:
+            # Standard tiling for non-chevron patterns
+            tile_array = np.array(seamless_tile)
+            tile_h, tile_w = tile_array.shape[:2]
+            
+            # Safety check for tile dimensions
+            if tile_h == 0 or tile_w == 0:
+                raise ValueError("Invalid tile dimensions")
+            
+            tiles_x = max((output_width // tile_w) + 1, 1)
+            tiles_y = max((output_height // tile_h) + 1, 1)
+            
+            # Create tiled image
+            try:
+                tiled = np.tile(tile_array, (tiles_y, tiles_x, 1))
+                complete_design = Image.fromarray(tiled[:output_height, :output_width])
+            except Exception as e:
+                # Fallback: resize the original image if tiling fails
+                complete_design = original_image.resize((output_width, output_height), Image.LANCZOS)
+        
+        # Step 4: Add realistic carpet texture
+        if quality_mode == "ultra":
+            complete_design = create_realistic_carpet_texture(complete_design)
+        
+        return complete_design, pattern_info, chevron_info
     
-    # Step 4: Add realistic carpet texture
-    if quality_mode == "ultra":
-        complete_design = create_realistic_carpet_texture(complete_design)
-    
-    return complete_design, pattern_info, chevron_info
+    except Exception as e:
+        # Fallback: return resized original image
+        complete_design = original_image.resize((output_width, output_height), Image.LANCZOS)
+        pattern_info = {'template_size': (20, 20), 'repeat_y': 20, 'repeat_x': 20, 'confidence': 1}
+        chevron_info = {'is_chevron': False, 'dominant_angle': 0, 'angles': []}
+        return complete_design, pattern_info, chevron_info
 
 def get_download_link(img, filename):
     """Generate download link for image"""
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG", quality=95, optimize=True)
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    href = f'<a href="data:image/png;base64,{img_str}" download="{filename}" style="background-color: #ff4b4b; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">📥 Download {filename}</a>'
-    return href
+    try:
+        buffered = io.BytesIO()
+        img.save(buffered, format="PNG", quality=95, optimize=True)
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        href = f'<a href="data:image/png;base64,{img_str}" download="{filename}" style="background-color: #ff4b4b; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">📥 Download {filename}</a>'
+        return href
+    except Exception as e:
+        return f"<p>Error generating download link: {str(e)}</p>"
 
 def main():
     st.set_page_config(
@@ -330,9 +408,9 @@ def main():
         
         col1, col2 = st.columns(2)
         with col1:
-            output_width = st.number_input("Width", min_value=200, max_value=5000, value=default_w, step=50)
+            output_width = st.number_input("Width", min_value=50, max_value=5000, value=default_w, step=50)
         with col2:
-            output_height = st.number_input("Height", min_value=200, max_value=5000, value=default_h, step=50)
+            output_height = st.number_input("Height", min_value=50, max_value=5000, value=default_h, step=50)
         
         st.subheader("⚙️ Quality Settings")
         quality_mode = st.selectbox(
@@ -355,6 +433,11 @@ def main():
             # Load image
             original_image = Image.open(uploaded_file).convert('RGB')
             
+            # Validate image
+            if original_image.size[0] < 10 or original_image.size[1] < 10:
+                st.error("Image too small. Please upload an image at least 10x10 pixels.")
+                return
+            
             col1, col2 = st.columns([1, 2])
             
             with col1:
@@ -364,22 +447,27 @@ def main():
                 # Quick analysis
                 if pattern_analysis:
                     with st.spinner("Analyzing pattern..."):
-                        pattern_info = advanced_pattern_analysis(original_image)
-                        chevron_info = detect_chevron_pattern(original_image)
+                        try:
+                            pattern_info = advanced_pattern_analysis(original_image)
+                            chevron_info = detect_chevron_pattern(original_image)
+                        except Exception as e:
+                            st.warning(f"Pattern analysis failed: {str(e)}")
+                            pattern_info = {'template_size': (20, 20), 'repeat_y': 20, 'repeat_x': 20, 'confidence': 1}
+                            chevron_info = {'is_chevron': False, 'dominant_angle': 0, 'angles': []}
                     
                     st.subheader("🔍 Pattern Analysis")
                     
                     # Pattern type
-                    if chevron_info['is_chevron']:
+                    if chevron_info.get('is_chevron', False):
                         pattern_type = "🔷 Chevron/Herringbone"
                         st.success(f"**Pattern Type:** {pattern_type}")
-                        st.info(f"**Dominant Angle:** {chevron_info['dominant_angle']:.1f}°")
+                        st.info(f"**Dominant Angle:** {chevron_info.get('dominant_angle', 0):.1f}°")
                     else:
                         pattern_type = "🔳 Geometric/Regular"
                         st.info(f"**Pattern Type:** {pattern_type}")
                     
-                    st.info(f"**Repeat Unit:** {pattern_info['repeat_x']}×{pattern_info['repeat_y']}px")
-                    st.info(f"**Confidence:** {pattern_info['confidence']}/10")
+                    st.info(f"**Repeat Unit:** {pattern_info.get('repeat_x', 20)}×{pattern_info.get('repeat_y', 20)}px")
+                    st.info(f"**Confidence:** {pattern_info.get('confidence', 1)}/10")
             
             with col2:
                 st.subheader("🎨 Generate Complete Design")
