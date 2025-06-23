@@ -1,490 +1,552 @@
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
+from PIL import Image, ImageFilter, ImageEnhance, ImageDraw, ImageOps
 import io
 import base64
 from sklearn.cluster import KMeans
 import cv2
+from scipy import ndimage
+from scipy.signal import correlate2d
+import matplotlib.pyplot as plt
 
-def extract_dominant_colors(image, n_colors=5):
-    """Extract dominant colors from the image using KMeans clustering"""
-    try:
-        data = np.array(image)
-        data = data.reshape((-1, 3))
-        kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init=10)
-        kmeans.fit(data)
-        return kmeans.cluster_centers_.astype(int)
-    except:
-        # Fallback method if sklearn not available
-        data = np.array(image)
-        data = data.reshape((-1, 3))
-        # Sample representative colors
-        indices = np.random.choice(len(data), min(1000, len(data)), replace=False)
-        sampled = data[indices]
-        # Simple clustering by grouping similar colors
-        colors = []
-        for color in sampled:
-            if not colors or min([np.linalg.norm(color - c) for c in colors]) > 30:
-                colors.append(color)
-                if len(colors) >= n_colors:
-                    break
-        while len(colors) < n_colors:
-            colors.append(data[np.random.randint(len(data))])
-        return np.array(colors[:n_colors])
+def advanced_pattern_analysis(image):
+    """Enhanced pattern analysis with better detection of repeating units"""
+    img_gray = np.array(image.convert('L'))
+    h, w = img_gray.shape
+    
+    # Template matching for pattern detection
+    patterns = []
+    
+    # Try different template sizes
+    for template_size in [(h//4, w//4), (h//3, w//3), (h//2, w//2)]:
+        th, tw = template_size
+        if th > 10 and tw > 10:
+            template = img_gray[:th, :tw]
+            
+            # Cross-correlation to find repeating patterns
+            correlation = correlate2d(img_gray, template, mode='valid')
+            
+            # Find peaks in correlation
+            threshold = np.max(correlation) * 0.7
+            peaks = np.where(correlation > threshold)
+            
+            if len(peaks[0]) > 1:
+                # Calculate pattern repeat distances
+                y_diffs = np.diff(sorted(peaks[0]))
+                x_diffs = np.diff(sorted(peaks[1]))
+                
+                y_repeat = np.median(y_diffs) if len(y_diffs) > 0 else th
+                x_repeat = np.median(x_diffs) if len(x_diffs) > 0 else tw
+                
+                patterns.append({
+                    'template_size': template_size,
+                    'repeat_y': int(y_repeat),
+                    'repeat_x': int(x_repeat),
+                    'confidence': len(peaks[0])
+                })
+    
+    # Select best pattern
+    if patterns:
+        best_pattern = max(patterns, key=lambda x: x['confidence'])
+        return best_pattern
+    else:
+        return {'template_size': (h//2, w//2), 'repeat_y': h//2, 'repeat_x': w//2, 'confidence': 1}
 
-def analyze_pattern_structure(image):
-    """Analyze the pattern structure to understand directionality and repetition"""
-    img_array = np.array(image.convert('L'))  # Convert to grayscale
-    h, w = img_array.shape
+def detect_chevron_pattern(image):
+    """Specialized detection for chevron/herringbone patterns"""
+    img_gray = np.array(image.convert('L'))
     
-    # Detect edges to understand pattern structure
-    try:
-        edges = cv2.Canny(img_array, 50, 150)
-    except:
-        # Fallback edge detection without OpenCV
-        from scipy import ndimage
-        sobel_x = ndimage.sobel(img_array, axis=1)
-        sobel_y = ndimage.sobel(img_array, axis=0)
-        edges = np.hypot(sobel_x, sobel_y)
-        edges = (edges > np.percentile(edges, 75)).astype(np.uint8) * 255
+    # Edge detection
+    edges = cv2.Canny(img_gray, 50, 150)
     
-    # Analyze horizontal and vertical patterns
-    horizontal_profile = np.mean(edges, axis=0)
-    vertical_profile = np.mean(edges, axis=1)
+    # Line detection using Hough transform
+    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=50)
     
-    # Find dominant frequencies
-    h_peaks = find_peaks_simple(horizontal_profile)
-    v_peaks = find_peaks_simple(vertical_profile)
+    if lines is not None:
+        angles = []
+        for rho, theta in lines[:, 0]:
+            angle = np.degrees(theta)
+            angles.append(angle)
+        
+        angles = np.array(angles)
+        
+        # Check for chevron pattern (two dominant angles)
+        unique_angles = []
+        for angle in angles:
+            if not unique_angles or min([abs(angle - ua) for ua in unique_angles]) > 10:
+                unique_angles.append(angle)
+        
+        is_chevron = len(unique_angles) >= 2
+        dominant_angle = np.median(angles) if len(angles) > 0 else 0
+        
+        return {
+            'is_chevron': is_chevron,
+            'dominant_angle': dominant_angle,
+            'angles': unique_angles[:4]  # Top 4 angles
+        }
     
-    # Determine pattern type
-    pattern_info = {
-        'horizontal_period': estimate_period(h_peaks, w) if h_peaks else w,
-        'vertical_period': estimate_period(v_peaks, h) if v_peaks else h,
-        'is_directional': len(h_peaks) > 2 or len(v_peaks) > 2,
-        'dominant_direction': 'horizontal' if len(h_peaks) > len(v_peaks) else 'vertical'
-    }
-    
-    return pattern_info
+    return {'is_chevron': False, 'dominant_angle': 0, 'angles': []}
 
-def find_peaks_simple(signal, threshold=None):
-    """Simple peak finding without scipy"""
-    if threshold is None:
-        threshold = np.mean(signal) + np.std(signal)
-    
-    peaks = []
-    for i in range(1, len(signal) - 1):
-        if signal[i] > signal[i-1] and signal[i] > signal[i+1] and signal[i] > threshold:
-            peaks.append(i)
-    return peaks
-
-def estimate_period(peaks, total_length):
-    """Estimate the repeating period from peaks"""
-    if len(peaks) < 2:
-        return total_length
-    
-    differences = np.diff(peaks)
-    if len(differences) == 0:
-        return total_length
-    
-    # Find most common difference
-    unique_diffs, counts = np.unique(differences, return_counts=True)
-    most_common_period = unique_diffs[np.argmax(counts)]
-    
-    return max(most_common_period, total_length // 10)  # Prevent too small periods
-
-def create_advanced_seamless_tile(image, pattern_info):
-    """Create a more sophisticated seamless tile based on pattern analysis"""
-    img_array = np.array(image).astype(float)
+def create_seamless_tile(image, pattern_info):
+    """Create a perfectly seamless tile using advanced blending"""
+    img_array = np.array(image).astype(np.float32)
     h, w, c = img_array.shape
     
-    # Create overlap regions for seamless blending
-    overlap_x = min(w // 4, pattern_info['horizontal_period'] // 2)
-    overlap_y = min(h // 4, pattern_info['vertical_period'] // 2)
+    # Calculate optimal tile size based on pattern analysis
+    tile_h = min(h, pattern_info['repeat_y'] * 2)
+    tile_w = min(w, pattern_info['repeat_x'] * 2)
     
-    overlap_x = max(overlap_x, 5)  # Minimum overlap
-    overlap_y = max(overlap_y, 5)
+    # Extract the base tile
+    tile = img_array[:tile_h, :tile_w]
     
-    result = img_array.copy()
+    # Create seamless edges using frequency domain blending
+    overlap = min(tile_h//8, tile_w//8, 20)
     
-    # Horizontal seamless blending
-    if w > overlap_x * 2:
-        left_region = result[:, :overlap_x]
-        right_region = result[:, -overlap_x:]
+    if overlap > 0:
+        # Horizontal seamless
+        left_edge = tile[:, :overlap]
+        right_edge = tile[:, -overlap:]
         
-        # Create smooth transition weights
-        weights = np.linspace(0, 1, overlap_x).reshape(1, -1, 1)
+        # Create smooth transition
+        for i in range(overlap):
+            alpha = i / overlap
+            tile[:, i] = left_edge[:, i] * (1 - alpha) + right_edge[:, i] * alpha
+            tile[:, -(i+1)] = right_edge[:, -(i+1)] * (1 - alpha) + left_edge[:, -(i+1)] * alpha
         
-        # Blend regions
-        blended_left = left_region * (1 - weights) + right_region * weights
-        blended_right = right_region * (1 - weights) + left_region * weights
+        # Vertical seamless
+        top_edge = tile[:overlap, :]
+        bottom_edge = tile[-overlap:, :]
         
-        result[:, :overlap_x] = blended_left
-        result[:, -overlap_x:] = blended_right
+        for i in range(overlap):
+            alpha = i / overlap
+            tile[i, :] = top_edge[i, :] * (1 - alpha) + bottom_edge[i, :] * alpha
+            tile[-(i+1), :] = bottom_edge[-(i+1), :] * (1 - alpha) + top_edge[-(i+1), :] * alpha
     
-    # Vertical seamless blending
-    if h > overlap_y * 2:
-        top_region = result[:overlap_y, :]
-        bottom_region = result[-overlap_y:, :]
-        
-        weights = np.linspace(0, 1, overlap_y).reshape(-1, 1, 1)
-        
-        blended_top = top_region * (1 - weights) + bottom_region * weights
-        blended_bottom = bottom_region * (1 - weights) + top_region * weights
-        
-        result[:overlap_y, :] = blended_top
-        result[-overlap_y:, :] = blended_bottom
-    
-    return Image.fromarray(result.astype(np.uint8))
+    return Image.fromarray(tile.astype(np.uint8))
 
-def create_pattern_variations(tile, pattern_info, num_variations=8):
-    """Create intelligent pattern variations based on carpet design principles"""
-    variations = [tile]  # Original
+def intelligent_chevron_tiling(tile, output_width, output_height, chevron_info):
+    """Specialized tiling for chevron patterns with proper alignment"""
+    tile_array = np.array(tile)
+    tile_h, tile_w = tile_array.shape[:2]
     
-    # For directional patterns like chevron/herringbone
-    if pattern_info['is_directional']:
-        # Mirror horizontally (common in carpet patterns)
-        variations.append(tile.transpose(Image.FLIP_LEFT_RIGHT))
-        
-        # Mirror vertically
-        variations.append(tile.transpose(Image.FLIP_TOP_BOTTOM))
-        
-        # Both flips
-        variations.append(tile.transpose(Image.FLIP_LEFT_RIGHT).transpose(Image.FLIP_TOP_BOTTOM))
-        
-        # Slight color variations to mimic carpet texture variations
-        for brightness_factor in [0.95, 1.05]:
-            enhancer = ImageEnhance.Brightness(tile)
-            variations.append(enhancer.enhance(brightness_factor))
-        
-        # Subtle contrast variations
-        for contrast_factor in [0.98, 1.02]:
-            enhancer = ImageEnhance.Contrast(tile)
-            variations.append(enhancer.enhance(contrast_factor))
+    # Calculate how many tiles needed
+    tiles_x = (output_width // tile_w) + 2
+    tiles_y = (output_height // tile_h) + 2
     
-    else:
-        # For non-directional patterns, use rotations
-        for angle in [90, 180, 270]:
-            variations.append(tile.rotate(angle, expand=False))
-    
-    return variations[:num_variations]
-
-def intelligent_carpet_tiling(tile, output_width, output_height, pattern_info, tiling_mode="carpet_realistic"):
-    """Advanced tiling specifically designed for carpet patterns"""
-    tile_w, tile_h = tile.size
-    
-    # Calculate grid
-    tiles_x = (output_width + tile_w - 1) // tile_w + 1  # Extra tile for overlap
-    tiles_y = (output_height + tile_h - 1) // tile_h + 1
-    
-    # Create larger canvas for seamless cropping
+    # Create larger canvas
     canvas_w = tiles_x * tile_w
     canvas_h = tiles_y * tile_h
-    canvas = Image.new('RGB', (canvas_w, canvas_h))
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     
-    # Create variations
-    variations = create_pattern_variations(tile, pattern_info)
-    
-    if tiling_mode == "carpet_realistic":
-        # Realistic carpet tiling with proper pattern flow
-        np.random.seed(42)  # Reproducible results
-        
-        for y in range(tiles_y):
-            for x in range(tiles_x):
-                # Choose variation based on position for natural carpet look
-                if pattern_info['is_directional']:
-                    # For directional patterns, alternate systematically
-                    if pattern_info['dominant_direction'] == 'horizontal':
-                        # Alternate every few rows for chevron effect
-                        variation_idx = 0 if (y // 2) % 2 == 0 else 1
-                    else:
-                        # Alternate every few columns
-                        variation_idx = 0 if (x // 2) % 2 == 0 else 1
-                else:
-                    # Random but controlled variation
-                    variation_idx = (x * 3 + y * 7) % len(variations)
+    # For chevron patterns, alternate tile orientations
+    for y in range(tiles_y):
+        for x in range(tiles_x):
+            current_tile = tile_array.copy()
+            
+            # Chevron pattern logic
+            if chevron_info['is_chevron']:
+                # Alternate flipping for chevron effect
+                if (x + y) % 2 == 1:
+                    current_tile = np.flip(current_tile, axis=1)  # Horizontal flip
                 
-                chosen_tile = variations[variation_idx % len(variations)]
-                
-                # Calculate position with slight overlap for seamless effect
-                pos_x = x * tile_w
-                pos_y = y * tile_h
-                
-                # Add subtle random offset for more natural look (carpet weaving effect)
-                if x > 0 and y > 0:  # Not on edges
-                    offset_range = min(5, tile_w // 20)
-                    pos_x += np.random.randint(-offset_range, offset_range + 1)
-                    pos_y += np.random.randint(-offset_range, offset_range + 1)
-                
-                # Ensure within bounds
-                pos_x = max(0, min(pos_x, canvas_w - tile_w))
-                pos_y = max(0, min(pos_y, canvas_h - tile_h))
-                
-                canvas.paste(chosen_tile, (pos_x, pos_y))
-    
-    elif tiling_mode == "perfect_seamless":
-        # Perfect seamless tiling for geometric patterns
-        for y in range(tiles_y):
-            for x in range(tiles_x):
-                canvas.paste(tile, (x * tile_w, y * tile_h))
+                # Additional rotation for some positions
+                if chevron_info['dominant_angle'] > 45:
+                    if (x % 2 == 0 and y % 2 == 1) or (x % 2 == 1 and y % 2 == 0):
+                        current_tile = np.flip(current_tile, axis=0)  # Vertical flip
+            
+            # Place tile
+            y_start = y * tile_h
+            y_end = min(y_start + tile_h, canvas_h)
+            x_start = x * tile_w
+            x_end = min(x_start + tile_w, canvas_w)
+            
+            canvas[y_start:y_end, x_start:x_end] = current_tile[:y_end-y_start, :x_end-x_start]
     
     # Crop to exact dimensions
-    final_image = canvas.crop((0, 0, output_width, output_height))
-    
-    # Apply carpet-specific post-processing
-    final_image = apply_carpet_enhancement(final_image)
-    
-    return final_image
+    final_canvas = canvas[:output_height, :output_width]
+    return Image.fromarray(final_canvas)
 
-def apply_carpet_enhancement(image):
-    """Apply enhancements to make the pattern look more like a real carpet"""
-    # Slight blur to mimic carpet texture
-    enhanced = image.filter(ImageFilter.GaussianBlur(radius=0.3))
+def create_realistic_carpet_texture(image):
+    """Add realistic carpet texture and appearance"""
+    # Convert to array
+    img_array = np.array(image).astype(np.float32)
     
-    # Add subtle noise for texture
-    img_array = np.array(enhanced).astype(float)
-    noise = np.random.normal(0, 2, img_array.shape)  # Very subtle noise
-    img_array = np.clip(img_array + noise, 0, 255)
-    enhanced = Image.fromarray(img_array.astype(np.uint8))
+    # Add subtle fiber texture
+    h, w = img_array.shape[:2]
     
-    # Enhance for carpet-like appearance
-    # Slightly reduce saturation for more realistic look
-    enhancer = ImageEnhance.Color(enhanced)
-    enhanced = enhancer.enhance(0.95)
+    # Create fiber-like noise
+    noise_scale = 0.5
+    fiber_noise = np.random.normal(0, noise_scale, (h, w, 3))
     
-    # Slight contrast adjustment
-    enhancer = ImageEnhance.Contrast(enhanced)
-    enhanced = enhancer.enhance(1.05)
+    # Create directional texture (carpet fibers)
+    x = np.arange(w)
+    y = np.arange(h)
+    X, Y = np.meshgrid(x, y)
     
-    # Very subtle sharpening
-    enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=0.5, percent=120, threshold=3))
+    # Subtle directional pattern
+    direction_pattern = np.sin(X * 0.1) * np.cos(Y * 0.1) * 2
+    direction_pattern = np.stack([direction_pattern] * 3, axis=2)
     
-    return enhanced
+    # Combine textures
+    textured = img_array + fiber_noise + direction_pattern
+    
+    # Add subtle color variations
+    color_variation = np.random.normal(1, 0.02, img_array.shape)
+    textured = textured * color_variation
+    
+    # Ensure values stay in valid range
+    textured = np.clip(textured, 0, 255)
+    
+    # Convert back to PIL Image
+    textured_image = Image.fromarray(textured.astype(np.uint8))
+    
+    # Apply carpet-specific filters
+    # Slight blur for fiber softness
+    textured_image = textured_image.filter(ImageFilter.GaussianBlur(radius=0.3))
+    
+    # Enhance contrast slightly
+    enhancer = ImageEnhance.Contrast(textured_image)
+    textured_image = enhancer.enhance(1.1)
+    
+    # Reduce saturation slightly for realistic look
+    enhancer = ImageEnhance.Color(textured_image)
+    textured_image = enhancer.enhance(0.95)
+    
+    return textured_image
 
-def get_image_download_link(img, filename):
+def generate_carpet_design(original_image, output_width, output_height, quality_mode="high"):
+    """Main function to generate complete carpet design"""
+    
+    # Step 1: Advanced pattern analysis
+    pattern_info = advanced_pattern_analysis(original_image)
+    chevron_info = detect_chevron_pattern(original_image)
+    
+    # Step 2: Create seamless tile
+    seamless_tile = create_seamless_tile(original_image, pattern_info)
+    
+    # Step 3: Intelligent tiling based on pattern type
+    if chevron_info['is_chevron']:
+        complete_design = intelligent_chevron_tiling(seamless_tile, output_width, output_height, chevron_info)
+    else:
+        # Standard tiling for non-chevron patterns
+        tile_array = np.array(seamless_tile)
+        tile_h, tile_w = tile_array.shape[:2]
+        
+        tiles_x = (output_width // tile_w) + 1
+        tiles_y = (output_height // tile_h) + 1
+        
+        # Create tiled image
+        tiled = np.tile(tile_array, (tiles_y, tiles_x, 1))
+        complete_design = Image.fromarray(tiled[:output_height, :output_width])
+    
+    # Step 4: Add realistic carpet texture
+    if quality_mode == "ultra":
+        complete_design = create_realistic_carpet_texture(complete_design)
+    
+    return complete_design, pattern_info, chevron_info
+
+def get_download_link(img, filename):
     """Generate download link for image"""
     buffered = io.BytesIO()
-    img.save(buffered, format="PNG", quality=95)
+    img.save(buffered, format="PNG", quality=95, optimize=True)
     img_str = base64.b64encode(buffered.getvalue()).decode()
-    href = f'<a href="data:image/png;base64,{img_str}" download="{filename}" style="text-decoration: none; color: #ff4b4b; font-weight: bold;">📥 Download {filename}</a>'
+    href = f'<a href="data:image/png;base64,{img_str}" download="{filename}" style="background-color: #ff4b4b; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">📥 Download {filename}</a>'
     return href
 
 def main():
     st.set_page_config(
-        page_title="Professional Carpet Design Generator",
-        page_icon="🏺",
-        layout="wide"
+        page_title="AI Carpet Pattern Generator",
+        page_icon="🎨",
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
     
-    st.title("🏺 Professional Carpet Design Pattern Generator")
-    st.markdown("Transform small carpet pattern samples into complete, realistic carpet designs for customer presentations")
+    # Custom CSS for better styling
+    st.markdown("""
+    <style>
+    .main-header {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .stButton > button {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        padding: 0.5rem 2rem;
+        border-radius: 25px;
+        font-weight: bold;
+    }
+    .metric-card {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #667eea;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    # Sidebar for controls
-    st.sidebar.header("🎛️ Design Controls")
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🎨 AI Carpet Pattern Generator</h1>
+        <p>Transform small pattern samples into complete, realistic carpet designs with AI precision</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    uploaded_file = st.file_uploader(
-        "Upload Carpet Pattern Sample",
-        type=['png', 'jpg', 'jpeg', 'bmp'],
-        help="Upload a small carpet pattern sample"
-    )
-    
-    if uploaded_file is not None:
-        # Load and analyze the pattern
-        original_image = Image.open(uploaded_file).convert('RGB')
+    # Sidebar
+    with st.sidebar:
+        st.header("🎛️ Design Controls")
         
-        with st.spinner("Analyzing pattern structure..."):
-            pattern_info = analyze_pattern_structure(original_image)
+        uploaded_file = st.file_uploader(
+            "Upload Pattern Sample",
+            type=['png', 'jpg', 'jpeg', 'bmp', 'tiff'],
+            help="Upload a small carpet pattern sample (square patterns work best)"
+        )
         
-        col1, col2 = st.columns([1, 2])
+        st.subheader("📐 Output Dimensions")
         
+        # Preset sizes
+        size_preset = st.selectbox(
+            "Size Preset",
+            ["Custom", "Small Rug (900×600)", "Medium Rug (1200×800)", "Large Rug (1500×1000)", "Room Size (2000×1400)", "Ultra Large (3000×2000)"]
+        )
+        
+        if size_preset == "Small Rug (900×600)":
+            default_w, default_h = 900, 600
+        elif size_preset == "Medium Rug (1200×800)":
+            default_w, default_h = 1200, 800
+        elif size_preset == "Large Rug (1500×1000)":
+            default_w, default_h = 1500, 1000
+        elif size_preset == "Room Size (2000×1400)":
+            default_w, default_h = 2000, 1400
+        elif size_preset == "Ultra Large (3000×2000)":
+            default_w, default_h = 3000, 2000
+        else:
+            default_w, default_h = 1200, 800
+        
+        col1, col2 = st.columns(2)
         with col1:
-            st.subheader("📐 Original Pattern")
-            st.image(original_image, caption=f"Size: {original_image.size[0]}×{original_image.size[1]}px")
-            
-            # Pattern analysis results
-            st.subheader("🔍 Pattern Analysis")
-            pattern_type = "Directional (Chevron/Herringbone)" if pattern_info['is_directional'] else "Non-directional"
-            st.info(f"**Type:** {pattern_type}")
-            st.info(f"**Dominant Direction:** {pattern_info['dominant_direction'].title()}")
-            st.info(f"**Horizontal Period:** {pattern_info['horizontal_period']}px")
-            st.info(f"**Vertical Period:** {pattern_info['vertical_period']}px")
-            
-            # Color analysis
-            with st.expander("🎨 Color Analysis"):
-                try:
-                    colors = extract_dominant_colors(original_image)
-                    color_cols = st.columns(min(len(colors), 3))
-                    for i, color in enumerate(colors[:3]):
-                        with color_cols[i]:
-                            color_hex = f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}"
-                            st.color_picker(f"C{i+1}", color_hex, disabled=True, key=f"color_{i}")
-                except Exception as e:
-                    st.error("Color analysis failed")
-        
+            output_width = st.number_input("Width", min_value=200, max_value=5000, value=default_w, step=50)
         with col2:
-            st.subheader("⚙️ Generation Settings")
+            output_height = st.number_input("Height", min_value=200, max_value=5000, value=default_h, step=50)
+        
+        st.subheader("⚙️ Quality Settings")
+        quality_mode = st.selectbox(
+            "Quality Mode",
+            ["high", "ultra"],
+            help="High: Fast generation | Ultra: Maximum quality with realistic texture"
+        )
+        
+        preview_mode = st.checkbox("Preview Mode (Faster)", value=False)
+        
+        # Advanced settings
+        with st.expander("🔧 Advanced Settings"):
+            enhance_seamless = st.checkbox("Enhanced Seamless Processing", value=True)
+            carpet_texture = st.checkbox("Add Carpet Texture", value=True)
+            pattern_analysis = st.checkbox("Advanced Pattern Analysis", value=True)
+    
+    # Main content area
+    if uploaded_file is not None:
+        try:
+            # Load image
+            original_image = Image.open(uploaded_file).convert('RGB')
             
-            # Carpet dimensions (realistic sizes)
-            col_dim1, col_dim2 = st.columns(2)
-            with col_dim1:
-                preset = st.selectbox(
-                    "Carpet Size Preset",
-                    ["Custom", "Small Rug (3×5 ft)", "Medium Rug (5×8 ft)", "Large Rug (8×10 ft)", "Room Size (10×14 ft)"],
-                    index=2
-                )
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.subheader("📷 Original Pattern")
+                st.image(original_image, caption=f"Size: {original_image.size[0]}×{original_image.size[1]}px")
                 
-                if preset == "Small Rug (3×5 ft)":
-                    output_width, output_height = 900, 1500
-                elif preset == "Medium Rug (5×8 ft)":
-                    output_width, output_height = 1500, 2400
-                elif preset == "Large Rug (8×10 ft)":
-                    output_width, output_height = 2400, 3000
-                elif preset == "Room Size (10×14 ft)":
-                    output_width, output_height = 3000, 4200
+                # Quick analysis
+                if pattern_analysis:
+                    with st.spinner("Analyzing pattern..."):
+                        pattern_info = advanced_pattern_analysis(original_image)
+                        chevron_info = detect_chevron_pattern(original_image)
+                    
+                    st.subheader("🔍 Pattern Analysis")
+                    
+                    # Pattern type
+                    if chevron_info['is_chevron']:
+                        pattern_type = "🔷 Chevron/Herringbone"
+                        st.success(f"**Pattern Type:** {pattern_type}")
+                        st.info(f"**Dominant Angle:** {chevron_info['dominant_angle']:.1f}°")
+                    else:
+                        pattern_type = "🔳 Geometric/Regular"
+                        st.info(f"**Pattern Type:** {pattern_type}")
+                    
+                    st.info(f"**Repeat Unit:** {pattern_info['repeat_x']}×{pattern_info['repeat_y']}px")
+                    st.info(f"**Confidence:** {pattern_info['confidence']}/10")
+            
+            with col2:
+                st.subheader("🎨 Generate Complete Design")
+                
+                # Adjust dimensions for preview
+                if preview_mode:
+                    gen_width = min(output_width, 800)
+                    gen_height = min(output_height, 600)
+                    st.warning(f"Preview Mode: Generating {gen_width}×{gen_height}px")
                 else:
-                    output_width = st.number_input("Width (pixels)", min_value=200, max_value=5000, value=1500, step=100)
-                    output_height = st.number_input("Height (pixels)", min_value=200, max_value=5000, value=2400, step=100)
-            
-            with col_dim2:
-                st.write("**Quality Settings**")
-                tiling_mode = st.selectbox(
-                    "Tiling Method",
-                    ["carpet_realistic", "perfect_seamless"],
-                    help="Carpet Realistic: Natural carpet appearance | Perfect Seamless: Exact pattern repetition"
-                )
+                    gen_width, gen_height = output_width, output_height
                 
-                resolution_quality = st.selectbox(
-                    "Output Quality",
-                    ["High (Presentation)", "Ultra (Print)"],
-                    help="High: Good for screen viewing | Ultra: Print quality"
-                )
-                
-                preview_mode = st.checkbox(
-                    "Preview Mode", 
-                    value=False, 
-                    help="Generate smaller preview first"
-                )
-            
-            # Advanced settings
-            with st.expander("🔧 Advanced Settings"):
-                enhance_carpet_texture = st.checkbox("Enhance Carpet Texture", value=True)
-                seamless_processing = st.checkbox("Advanced Seamless Processing", value=True)
-                color_variation = st.slider("Color Variation", 0.0, 0.3, 0.1, 0.05)
-            
-            # Generate button
-            if st.button("🎨 Generate Professional Carpet Design", type="primary", use_container_width=True):
-                with st.spinner("Creating professional carpet design... This may take a moment for high quality results."):
+                # Generate button
+                if st.button("🚀 Generate AI Carpet Design", type="primary", use_container_width=True):
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
                     try:
-                        # Adjust for preview mode
-                        if preview_mode:
-                            gen_width = min(output_width, 800)
-                            gen_height = min(output_height, 600)
-                            st.info(f"Generating preview: {gen_width}×{gen_height}px")
-                        else:
-                            gen_width, gen_height = output_width, output_height
+                        # Generation process
+                        status_text.text("🔍 Analyzing pattern structure...")
+                        progress_bar.progress(20)
                         
-                        # Process the tile
-                        processed_tile = original_image
+                        status_text.text("🧩 Creating seamless tile...")
+                        progress_bar.progress(40)
                         
-                        if seamless_processing:
-                            st.info("🔄 Processing for seamless tiling...")
-                            processed_tile = create_advanced_seamless_tile(processed_tile, pattern_info)
+                        status_text.text("🎨 Generating complete design...")
+                        progress_bar.progress(60)
                         
-                        # Generate the complete design
-                        st.info("🎨 Generating complete carpet design...")
-                        complete_design = intelligent_carpet_tiling(
-                            processed_tile, 
-                            gen_width, 
-                            gen_height, 
-                            pattern_info,
-                            tiling_mode
+                        # Generate the design
+                        complete_design, pattern_info, chevron_info = generate_carpet_design(
+                            original_image, gen_width, gen_height, quality_mode
                         )
+                        
+                        status_text.text("✨ Applying final enhancements...")
+                        progress_bar.progress(80)
+                        
+                        # Final enhancements
+                        if carpet_texture and quality_mode == "ultra":
+                            complete_design = create_realistic_carpet_texture(complete_design)
+                        
+                        progress_bar.progress(100)
+                        status_text.text("✅ Generation complete!")
                         
                         # Display result
                         st.subheader("✨ Generated Carpet Design")
-                        st.image(complete_design, caption=f"Professional Carpet Design: {complete_design.size[0]}×{complete_design.size[1]}px")
+                        st.image(complete_design, caption=f"AI Generated Design: {complete_design.size[0]}×{complete_design.size[1]}px")
                         
-                        # Download options
-                        st.markdown("### 📥 Download Options")
+                        # Download section
+                        st.subheader("📥 Download")
+                        
                         col_dl1, col_dl2 = st.columns(2)
-                        
                         with col_dl1:
-                            st.markdown(get_image_download_link(complete_design, "carpet_design.png"), unsafe_allow_html=True)
+                            st.markdown(get_download_link(complete_design, "ai_carpet_design.png"), unsafe_allow_html=True)
                         
                         with col_dl2:
-                            # Generate high-res version if in preview mode
                             if preview_mode:
                                 if st.button("Generate Full Resolution", type="secondary"):
-                                    with st.spinner("Generating full resolution design..."):
-                                        full_res_design = intelligent_carpet_tiling(
-                                            processed_tile, output_width, output_height, pattern_info, tiling_mode
+                                    with st.spinner("Generating full resolution..."):
+                                        full_design, _, _ = generate_carpet_design(
+                                            original_image, output_width, output_height, quality_mode
                                         )
-                                        st.markdown(get_image_download_link(full_res_design, "carpet_design_full_res.png"), unsafe_allow_html=True)
+                                        st.markdown(get_download_link(full_design, "ai_carpet_full_res.png"), unsafe_allow_html=True)
                         
-                        # Design statistics
-                        st.subheader("📊 Design Statistics")
-                        col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+                        # Statistics
+                        st.subheader("📊 Generation Statistics")
                         
-                        original_pixels = original_image.size[0] * original_image.size[1]
-                        generated_pixels = complete_design.size[0] * complete_design.size[1]
-                        expansion_ratio = generated_pixels / original_pixels
+                        col_s1, col_s2, col_s3, col_s4 = st.columns(4)
                         
-                        with col_stat1:
-                            st.metric("Original", f"{original_image.size[0]}×{original_image.size[1]}")
-                        with col_stat2:
-                            st.metric("Generated", f"{complete_design.size[0]}×{complete_design.size[1]}")
-                        with col_stat3:
-                            st.metric("Expansion", f"{expansion_ratio:.1f}×")
-                        with col_stat4:
-                            estimated_size_mb = (generated_pixels * 3) / (1024 * 1024)
-                            st.metric("Est. Size", f"{estimated_size_mb:.1f}MB")
+                        with col_s1:
+                            st.markdown(f"""
+                            <div class="metric-card">
+                                <h4>Original Size</h4>
+                                <h2>{original_image.size[0]}×{original_image.size[1]}</h2>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        with col_s2:
+                            st.markdown(f"""
+                            <div class="metric-card">
+                                <h4>Generated Size</h4>
+                                <h2>{complete_design.size[0]}×{complete_design.size[1]}</h2>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        with col_s3:
+                            expansion = (complete_design.size[0] * complete_design.size[1]) / (original_image.size[0] * original_image.size[1])
+                            st.markdown(f"""
+                            <div class="metric-card">
+                                <h4>Size Expansion</h4>
+                                <h2>{expansion:.1f}×</h2>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        with col_s4:
+                            file_size = (complete_design.size[0] * complete_design.size[1] * 3) / (1024 * 1024)
+                            st.markdown(f"""
+                            <div class="metric-card">
+                                <h4>Est. File Size</h4>
+                                <h2>{file_size:.1f}MB</h2>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # Clear progress indicators
+                        progress_bar.empty()
+                        status_text.empty()
                         
                     except Exception as e:
-                        st.error(f"Generation failed: {str(e)}")
-                        st.info("Try reducing dimensions or using preview mode first.")
+                        st.error(f"❌ Generation failed: {str(e)}")
+                        st.info("💡 Try reducing dimensions or using preview mode first.")
+                        progress_bar.empty()
+                        status_text.empty()
+        
+        except Exception as e:
+            st.error(f"❌ Error loading image: {str(e)}")
     
     else:
-        # Instructions and examples
-        st.info("👆 Upload a carpet pattern sample to begin generating professional designs")
+        # Landing page
+        st.subheader("🎯 How It Works")
         
-        st.subheader("🎯 Optimized for Carpet Patterns")
-        st.markdown("""
-        This tool is specifically designed for carpet and textile patterns:
-        - **Chevron & Herringbone patterns** - Maintains proper directional flow
-        - **Geometric patterns** - Preserves pattern integrity
-        - **Textile textures** - Adds realistic carpet texture effects
-        - **Color variations** - Mimics natural carpet manufacturing variations
-        """)
+        col_info1, col_info2, col_info3 = st.columns(3)
         
-        col_help1, col_help2 = st.columns(2)
-        
-        with col_help1:
-            st.subheader("📝 Usage Instructions")
+        with col_info1:
             st.markdown("""
-            1. **Upload** your carpet pattern sample
-            2. **Review** automatic pattern analysis
-            3. **Select** carpet size preset or custom dimensions
-            4. **Choose** tiling method (realistic vs seamless)
-            5. **Generate** professional carpet design
-            6. **Download** for customer presentations
+            ### 1. 📤 Upload Pattern
+            - Upload a small carpet pattern sample
+            - Square or rectangular patterns work best
+            - High resolution recommended (300px+)
             """)
         
-        with col_help2:
-            st.subheader("💡 Best Practices")
+        with col_info2:
             st.markdown("""
-            - Use **high-quality** pattern samples (300+ pixels)
-            - **Square or rectangular** patterns work best
-            - Enable **advanced seamless processing** for chevron patterns
-            - Use **preview mode** for testing large designs
-            - **Carpet realistic** mode for customer presentations
+            ### 2. 🤖 AI Analysis
+            - Advanced pattern recognition
+            - Chevron/Herringbone detection
+            - Seamless tile generation
             """)
         
-        st.subheader("🔧 Technical Requirements")
-        st.code("""
-# Required packages:
-pip install streamlit pillow numpy scikit-learn opencv-python
-
-# For best results, ensure all packages are installed
-        """)
+        with col_info3:
+            st.markdown("""
+            ### 3. ✨ Generate Design
+            - Intelligent tiling algorithms
+            - Realistic carpet texture
+            - Customizable dimensions
+            """)
+        
+        st.subheader("🌟 Key Features")
+        
+        feature_col1, feature_col2 = st.columns(2)
+        
+        with feature_col1:
+            st.markdown("""
+            - **🎯 Pattern Recognition**: Detects chevron, herringbone, and geometric patterns
+            - **🧩 Seamless Tiling**: Creates perfect seamless connections
+            - **🎨 Realistic Texture**: Adds authentic carpet fiber texture
+            - **📐 Custom Dimensions**: Any size from small rugs to room-size carpets
+            """)
+        
+        with feature_col2:
+            st.markdown("""
+            - **⚡ Fast Processing**: Preview mode for quick results
+            - **🎛️ Quality Control**: High and Ultra quality modes
+            - **💾 Easy Download**: Direct PNG download with optimization
+            - **📊 Detailed Analytics**: Pattern analysis and generation statistics
+            """)
+        
+        st.info("👆 Upload a carpet pattern sample above to get started!")
 
 if __name__ == "__main__":
     main()
