@@ -4,3 +4,4 @@ Pillow
 matplotlib
 scikit-image
 opencv-python-headless
+scikit-learn
